@@ -28,7 +28,8 @@ struct mem_cgroup;
 
 #ifdef CONFIG_MEMCG
 extern void vmpressure(gfp_t gfp, struct mem_cgroup *memcg,
-		       unsigned long scanned, unsigned long reclaimed);
+		       unsigned long scanned, unsigned long reclaimed,
+		       int order);
 extern void vmpressure_prio(gfp_t gfp, struct mem_cgroup *memcg, int prio);
 
 extern void vmpressure_init(struct vmpressure *vmpr);
