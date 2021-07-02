@@ -30,7 +30,8 @@ struct mem_cgroup;
 extern void vmpressure(gfp_t gfp, struct mem_cgroup *memcg,
 		       unsigned long scanned, unsigned long reclaimed,
 		       int order);
-extern void vmpressure_prio(gfp_t gfp, struct mem_cgroup *memcg, int prio);
+extern void vmpressure_prio(gfp_t gfp, struct mem_cgroup *memcg, int prio,
+			    int order);
 
 extern void vmpressure_init(struct vmpressure *vmpr);
 extern void vmpressure_cleanup(struct vmpressure *vmpr);
