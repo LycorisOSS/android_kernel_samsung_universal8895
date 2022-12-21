@@ -265,38 +265,6 @@ void vmpressure(gfp_t gfp, struct mem_cgroup *memcg,
 	schedule_work(&vmpr->work);
 }
 
-bool vmpressure_inc_users(int order)
-{
-	struct vmpressure *vmpr = &global_vmpressure;
-	unsigned long flags;
-
-	if (order > PAGE_ALLOC_COSTLY_ORDER)
-		return false;
-
-	write_lock_irqsave(&vmpr->users_lock, flags);
-	if (atomic_long_inc_return_relaxed(&vmpr->users) == 1) {
-		/* Clear out stale vmpressure data when reclaim begins */
-		spin_lock(&vmpr->sr_lock);
-		vmpr->scanned = 0;
-		vmpr->reclaimed = 0;
-		vmpr->stall = 0;
-		spin_unlock(&vmpr->sr_lock);
-	}
-	write_unlock_irqrestore(&vmpr->users_lock, flags);
-
-	return true;
-}
-
-void vmpressure_dec_users(void)
-{
-	struct vmpressure *vmpr = &global_vmpressure;
-
-	/* Decrement the vmpressure user count with release semantics */
-	smp_mb__before_atomic();
-	atomic_long_dec(&vmpr->users);
-}
-
-#ifdef CONFIG_MEMCG
 static unsigned long calculate_vmpressure_win(void)
 {
 	long x;
@@ -321,72 +289,89 @@ static unsigned long calculate_vmpressure_win(void)
 
 static void vmpressure_memcg(gfp_t gfp, struct mem_cgroup *memcg, bool critical,
 			     bool tree, unsigned long scanned,
-			     unsigned long reclaimed)
+			     unsigned long reclaimed) { }
 {
-	struct vmpressure *vmpr = memcg_to_vmpressure(memcg);
+        struct vmpressure *vmpr = memcg_to_vmpressure(memcg);
+        unsigned long flags;
+
+        /*
+         * If we got here with no pages scanned, then that is an indicator
+         * that reclaimer was unable to find any shrinkable LRUs at the
+         * current scanning depth. But it does not mean that we should
+         * report the critical pressure, yet. If the scanning priority
+         * (scanning depth) goes too high (deep), we will be notified
+         * through vmpressure_prio(). But so far, keep calm.
+         */
+        if (critical)
+                scanned = calculate_vmpressure_win();
+        else if (!scanned)
+                return;
+
+        if (tree) {
+                spin_lock_irqsave(&vmpr->sr_lock, flags);
+                scanned = vmpr->tree_scanned += scanned;
+                vmpr->tree_reclaimed += reclaimed;
+                spin_unlock_irqrestore(&vmpr->sr_lock, flags);
+
+                if (!critical && scanned < calculate_vmpressure_win())
+                        return;
+                schedule_work(&vmpr->work);
+        } else {
+                enum vmpressure_levels level;
+                unsigned long pressure;
+
+                /* For now, no users for root-level efficiency */
+                if (!memcg || memcg == root_mem_cgroup)
+                        return;
+
+                spin_lock_irqsave(&vmpr->sr_lock, flags);
+                scanned = vmpr->scanned += scanned;
+                reclaimed = vmpr->reclaimed += reclaimed;
+                if (!critical && scanned < calculate_vmpressure_win()) {
+                        spin_unlock_irqrestore(&vmpr->sr_lock, flags);
+                        return;
+                }
+                vmpr->scanned = vmpr->reclaimed = 0;
+                spin_unlock_irqrestore(&vmpr->sr_lock, flags);
+
+                pressure = vmpressure_calc_pressure(scanned, reclaimed);
+                level = vmpressure_level(pressure);
+
+                if (level > VMPRESSURE_LOW) {
+                        /*
+                         * Let the socket buffer allocator know that
+                         * we are having trouble reclaiming LRU pages.
+                         *
+                         * For hysteresis keep the pressure state
+                         * asserted for a second in which subsequent
+                         * pressure events can occur.
+                         */
+                        memcg->socket_pressure = jiffies + HZ;
+                }
+        }
+}
+
+bool vmpressure_inc_users(int order)
+{
+	struct vmpressure *vmpr = &global_vmpressure;
 	unsigned long flags;
 
-	/*
-	 * If we got here with no pages scanned, then that is an indicator
-	 * that reclaimer was unable to find any shrinkable LRUs at the
-	 * current scanning depth. But it does not mean that we should
-	 * report the critical pressure, yet. If the scanning priority
-	 * (scanning depth) goes too high (deep), we will be notified
-	 * through vmpressure_prio(). But so far, keep calm.
-	 */
-	if (critical)
-		scanned = calculate_vmpressure_win();
-	else if (!scanned)
-		return;
+	if (order > PAGE_ALLOC_COSTLY_ORDER)
+		return false;
 
-	if (tree) {
-		spin_lock_irqsave(&vmpr->sr_lock, flags);
-		scanned = vmpr->tree_scanned += scanned;
-		vmpr->tree_reclaimed += reclaimed;
-		spin_unlock_irqrestore(&vmpr->sr_lock, flags);
-
-		if (!critical && scanned < calculate_vmpressure_win())
-			return;
-		schedule_work(&vmpr->work);
-	} else {
-		enum vmpressure_levels level;
-		unsigned long pressure;
-
-		/* For now, no users for root-level efficiency */
-		if (!memcg || memcg == root_mem_cgroup)
-			return;
-
-		spin_lock_irqsave(&vmpr->sr_lock, flags);
-		scanned = vmpr->scanned += scanned;
-		reclaimed = vmpr->reclaimed += reclaimed;
-		if (!critical && scanned < calculate_vmpressure_win()) {
-			spin_unlock_irqrestore(&vmpr->sr_lock, flags);
-			return;
-		}
-		vmpr->scanned = vmpr->reclaimed = 0;
-		spin_unlock_irqrestore(&vmpr->sr_lock, flags);
-
-		pressure = vmpressure_calc_pressure(scanned, reclaimed);
-		level = vmpressure_level(pressure);
-
-		if (level > VMPRESSURE_LOW) {
-			/*
-			 * Let the socket buffer allocator know that
-			 * we are having trouble reclaiming LRU pages.
-			 *
-			 * For hysteresis keep the pressure state
-			 * asserted for a second in which subsequent
-			 * pressure events can occur.
-			 */
-			memcg->socket_pressure = jiffies + HZ;
-		}
+	write_lock_irqsave(&vmpr->users_lock, flags);
+	if (atomic_long_inc_return_relaxed(&vmpr->users) == 1) {
+		/* Clear out stale vmpressure data when reclaim begins */
+		spin_lock(&vmpr->sr_lock);
+		vmpr->scanned = 0;
+		vmpr->reclaimed = 0;
+		vmpr->stall = 0;
+		spin_unlock(&vmpr->sr_lock);
 	}
+	write_unlock_irqrestore(&vmpr->users_lock, flags);
+
+	return true;
 }
-#else
-static void vmpressure_memcg(gfp_t gfp, struct mem_cgroup *memcg, bool critical,
-			     bool tree, unsigned long scanned,
-			     unsigned long reclaimed) { }
-#endif
 
 static void vmpressure_global(gfp_t gfp, unsigned long scanned,
 			      unsigned long reclaimed)
